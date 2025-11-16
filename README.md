@@ -46,12 +46,18 @@ Dostępne flagi CLI:
 - `--json <file>` — zapisz metadane znalezionych AP (SSID, BSSID, CH, ENC, RSSI, vendor) w pliku JSON po zakończeniu przechwytywania.
 - `--filter-enc <enc>` — podczas skanowania pokaż tylko AP zawierające podany tekst w polu szyfrowania (np. `WPA2`).
 - `-h, --help` — wyświetl pomoc i zakończ.
+- `-t, --time <s>` — podczas przechwytywania zakończ po <s> sekundach; jeśli opcja nie podana, program przerwie przechwytywanie po wykryciu 3 ramek EAPOL (heurystyka wykrywania handshake'ów).
 
 Przykłady:
 
 - automatyczny monitor + live UI:
 ```bash
 sudo ./start --force-monitor
+```
+
+- przechwytywanie przez 30 sekund:
+```bash
+sudo ./start -t 30
 ```
 
 - bez zmiany trybu interfejsu:
@@ -71,6 +77,10 @@ sudo ./start --oui-db /path/to/oui.txt --json results.json
  - Działa live-skan beaconów w trybie `ncurses`. Odświeżanie co ~300 ms. Lista jest na żywo sortowana według siły sygnału (RSSI), na górze widoczne są najsilniejsze AP.
  - Interaktywny wybór AP: użyj klawiszy `↑` / `↓` aby poruszać kursorem po liście i naciśnij `Enter`, aby wybrać AP. Alternatywnie możesz zakończyć skan `Ctrl+C` lub `q`, po czym program poprosi o wybór indeksem.
  - Po wyborze AP wpisz nazwę pliku do zapisu (domyślnie `capture.pcap`) — program zapisuje surowe pakiety do wskazanego pliku.
+
+Domyślne zachowanie zakończenia przechwytywania:
+- Jeśli użyjesz `-t/--time`, program zakończy przechwytywanie po upływie podanej liczby sekund.
+- Jeśli `-t` nie jest ustawione, program będzie nasłuchiwał i zakończy przechwytywanie, gdy wykryje 3 ramki EAPOL (EtherType `0x888e`) — to prosty heurystyczny sposób na wykrycie handshake'ów WPA/WPA2 i traktujemy to jako sygnał do zakończenia zbierania danych.
 
 ## Uwagi i ograniczenia
 - Tryb monitor i działanie filtrów BPF wymaga, aby interfejs zwracał DLT 802.11 (radiotap). Na niektórych sterownikach lub platformach ustawienie filtra może zwracać błąd "Network is down" lub podobny — w takim wypadku sprawdź czy interfejs rzeczywiście działa w trybie monitor lub użyj `--no-monitor`.

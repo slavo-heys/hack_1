@@ -89,6 +89,8 @@ int main(int argc, char **argv) {
     std::string oui_db_file;
     std::string json_out_file;
     std::string filter_enc;
+    int capture_time = 0; // seconds; 0 = fallback to eapol_threshold
+    int eapol_threshold = 3; // ile ramek EAPOL powoduje zakończenie, gdy -t nie ustawione
     for (int ai = 1; ai < argc; ++ai) {
         std::string a = argv[ai];
         if (a == "--no-monitor") opt_no_monitor = true;
@@ -96,13 +98,17 @@ int main(int argc, char **argv) {
         else if (a == "--oui-db" && ai+1 < argc) { oui_db_file = argv[++ai]; }
         else if (a == "--json" && ai+1 < argc) { json_out_file = argv[++ai]; }
         else if (a == "--filter-enc" && ai+1 < argc) { filter_enc = argv[++ai]; }
+        else if ((a == "-t" || a == "--time") && ai+1 < argc) { capture_time = std::atoi(argv[++ai]); if (capture_time < 0) capture_time = 0; }
+        else if ((a == "--eapol-count") && ai+1 < argc) { eapol_threshold = std::atoi(argv[++ai]); if (eapol_threshold < 1) eapol_threshold = 1; }
         else if (a == "-h" || a == "--help") {
-            std::cout << "Użycie: " << argv[0] << " [--no-monitor] [--force-monitor] [--oui-db <file>] [--json <file>] [--filter-enc <enc>]\n";
+            std::cout << "Użycie: " << argv[0] << " [--no-monitor] [--force-monitor] [--oui-db <file>] [--json <file>] [--filter-enc <enc>] [-t <s>]\n";
             std::cout << "  --no-monitor     : nie próbuj ustawiać trybu monitor\n";
             std::cout << "  --force-monitor  : wymuś monitor (spróbuj, nawet jeśli niezalecane)\n";
             std::cout << "  --oui-db <file>  : załaduj bazę OUI (format 'xx:xx:xx Vendor' lub IEEE oui.txt)\n";
             std::cout << "  --json <file>    : zapisz metadane znalezionych AP do pliku JSON po przechwytywaniu\n";
             std::cout << "  --filter-enc <e> : podczas skanowania pokazuj tylko AP zawierające <e> w typie szyfrowania\n";
+            std::cout << "  -t, --time <s>   : podczas przechwytywania zakończ po <s> sekundach; jeśli brak, zatrzymaj po wykryciu N ramek EAPOL (patrz --eapol-count)\n";
+            std::cout << "  --eapol-count <n>: liczba ramek EAPOL potrzebna do zakończenia gdy -t nie ustawione (domyślnie 3)\n";
             return 0;
         }
     }
@@ -571,7 +577,7 @@ int main(int argc, char **argv) {
 
         // drukuj nagłówek (używamy ncurses, nie ANSI escape)
         erase();
-        mvprintw(0,0, "Live:  wykryte sieci (Ctrl+C aby zakończyć)");
+        mvprintw(0,0, "Live:  wykryte sieci (Ctrl+C aby zakonczyc)");
         // nagłówek kolumn z dopasowaną szerokością
         mvprintw(1,0, "idx | %-*s | %-*s | %*s | %-*s | %*s | %-*s",
             COL_SSID, "SSID",
@@ -633,8 +639,8 @@ int main(int argc, char **argv) {
     std::sort(snap_final.begin(), snap_final.end(), [](const APInfo &a, const APInfo &b){ return a.max_rssi > b.max_rssi; });
     list = snap_final;
 
-    std::cout << "\nZnalezione sieci:\n";
-    std::cout << "idx | " << std::left << std::setw(COL_SSID) << "SSID" << " | "
+    std::cout << "\nZnalezione sieci:\n\n";
+    std::cout << "idx  | " << std::left << std::setw(COL_SSID) << "SSID" << " | "
               << std::left << std::setw(COL_BSSID) << "BSSID" << " | "
               << std::right << std::setw(COL_CH) << "CH" << " | "
               << std::left << std::setw(COL_ENC) << "ENC" << " | "
@@ -656,7 +662,7 @@ int main(int argc, char **argv) {
             << std::left << std::setw(COL_ENC) << a.enc << " | "
             << rcol << std::right << std::setw(COL_RSSI) << (int)a.max_rssi << C_RESET << " | "
             << std::left << std::setw(COL_VENDOR) << a.vendor;
-        std::cout << oss.str() << "\n";
+        std::cout << oss.str() << "\n\n";
         ++i;
     }
 
@@ -701,11 +707,23 @@ int main(int argc, char **argv) {
         pcap_freecode(&fp);
     }
 
-    // Poproś o nazwę pliku wyjściowego
+    // Poproś o nazwę pliku wyjściowego. Jeśli użytkownik wciśnie Enter bez niczego,
+    // wygenerujemy nazwę domyślną opartą na znaczniku czasu: capture_YYYYMMDD_HHMMSS.pcap
     std::string outfile;
-    std::cout << "Nazwa pliku do zapisu (.pcap) [capture.pcap]: ";
-    std::cin >> outfile;
-    if (outfile.empty()) outfile = "capture.pcap";
+    std::cout << "Nazwa pliku do zapisu (.pcap) [capture_<timestamp>.pcap]: ";
+    std::string tmp;
+    std::getline(std::cin, tmp); // skasuj pozostały newline po wcześniejszym wejściu
+    std::getline(std::cin, outfile);
+    if (outfile.empty()) {
+        time_t t = time(nullptr);
+        struct tm *lt = localtime(&t);
+        char ts[64];
+        if (lt) strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", lt);
+        else std::snprintf(ts, sizeof(ts), "%lld", (long long)t);
+        std::string def = std::string("capture_") + ts + ".pcap";
+        outfile = def;
+        std::cout << "Używam domyślnej nazwy: " << outfile << "\n";
+    }
 
     // Otwórz dumper
     global_dumper = pcap_dump_open(global_handle, outfile.c_str());
@@ -722,17 +740,80 @@ int main(int argc, char **argv) {
     std::cout << "Rozpoczynam przechwytywanie dla " << target.ssid << ". Naciśnij Ctrl+C, aby zakończyć.\n";
 
     // Pętla przechwytywania — zapisujemy pakiety do pliku
-    int ret = pcap_loop(global_handle, 0, packet_handler, reinterpret_cast<u_char*>(global_dumper));
-    if (ret == -1) {
-        std::cerr << "Błąd podczas pcap_loop: " << pcap_geterr(global_handle) << "\n";
-    } else {
-        std::cout << "Pętla przechwytywania zakończona.\n";
+    // Jeśli użytkownik podał -t/--time, przechwytywanie zakończy się po tej liczbie sekund.
+    // Jeśli nie podano limitu czasu, zakończymy przechwytywanie po wykryciu 3 ramek EAPOL (typ 0x888e).
+    time_t start_ts = time(nullptr);
+    int eapol_count = 0;
+    while (!stop_flag) {
+        struct pcap_pkthdr *h;
+        const u_char *pkt;
+        int res = pcap_next_ex(global_handle, &h, &pkt);
+        if (res == 1) {
+            // Zapisz pakiet
+            pcap_dump(reinterpret_cast<u_char*>(global_dumper), h, pkt);
+            // Szybkie skanowanie bufora w poszukiwaniu sekwencji 0x88 0x8e (EAPOL)
+            bool found_eapol = false;
+            if (h->caplen >= 2) {
+                for (u_int i = 0; i + 1 < h->caplen; ++i) {
+                    if (pkt[i] == 0x88 && pkt[i+1] == 0x8e) { found_eapol = true; break; }
+                }
+            }
+            if (found_eapol) {
+                ++eapol_count;
+            }
+        } else if (res == 0) {
+            // timeout, kontynuuj
+            continue;
+        } else if (res == -1) {
+            std::cerr << "Błąd podczas czytania pakietu: " << pcap_geterr(global_handle) << "\n";
+            break;
+        } else if (res == -2) {
+            // EOF
+            break;
+        }
+
+        // Sprawdź warunki zakończenia
+        if (capture_time > 0) {
+            if (difftime(time(nullptr), start_ts) >= capture_time) {
+                std::cout << "Koniec: osiągnięto limit czasu (" << capture_time << "s).\n";
+                break;
+            }
+        } else {
+            if (eapol_count >= eapol_threshold) {
+                std::cout << "Koniec: wykryto " << eapol_threshold << " ramek EAPOL (przybliżenie hashy).\n";
+                break;
+            }
+        }
     }
+    std::cout << "Pętla przechwytywania zakończona.\n";
 
     // Sprzątanie: zamknij pliki i przywróć interfejs jeśli trzeba
     if (global_dumper) pcap_dump_close(global_dumper);
     if (global_handle) pcap_close(global_handle);
     pcap_freealldevs(alldevs);
+
+    // Jeśli podano --json <file>, zapisz listę znalezionych AP i metadane do JSON
+    if (!json_out_file.empty()) {
+        std::ofstream jf(json_out_file);
+        if (jf) {
+            jf << "[\n";
+            for (size_t ii = 0; ii < list.size(); ++ii) {
+                auto &a = list[ii];
+                // proste escaping dla cudzysłowów w SSID
+                std::string ssid = a.ssid;
+                for (char &c: ssid) if (c == '"') c = '\'';
+                jf << "  {\"ssid\": \"" << ssid << "\", \"bssid\": \"" << a.bssid << "\", ";
+                jf << "\"channel\": " << a.channel << ", \"enc\": \"" << a.enc << "\", ";
+                jf << "\"rssi\": " << (int)a.max_rssi << ", \"vendor\": \"" << a.vendor << "\" }";
+                if (ii + 1 < list.size()) jf << ",\n"; else jf << "\n";
+            }
+            jf << "]\n";
+            jf.close();
+            std::cout << "Zapisano metadane do JSON: " << json_out_file << "\n";
+        } else {
+            std::cerr << "Nie można otworzyć pliku JSON do zapisu: " << json_out_file << "\n";
+        }
+    }
 
     if (monitor_enabled) {
         std::cout << "Przywracam interfejs do trybu managed...\n";
