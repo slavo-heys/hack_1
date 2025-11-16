@@ -193,7 +193,7 @@ int main(int argc, char **argv) {
     }
 
     int choice = 0;
-    std::cout << "Wybierz interfejs Wi‑Fi (numer): ";
+    std::cout << "\nWybierz interfejs Wi‑Fi (numer): ";
     std::cin >> choice;
     if (choice < 0 || choice >= static_cast<int>(wifi_ifaces.size())) {
         std::cerr << "Nieprawidłowy wybór.\n";
@@ -592,7 +592,7 @@ int main(int argc, char **argv) {
             else rcol = C_RED;
             // highlight kursora
             if ((int)idx == cursor) attron(A_REVERSE);
-            mvprintw(r++, 0, "%3d  | %-*s | %-*s | %*d | %-*s | %*d | %-*s",
+            mvprintw(r++, 0, "%3d | %-*s | %-*s | %*d | %-*s | %*d | %-*s",
                 ii,
                 COL_SSID, disp_ssid.c_str(),
                 COL_BSSID, a.bssid.c_str(),
