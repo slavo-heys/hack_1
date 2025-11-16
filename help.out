@@ -1,0 +1,3 @@
+Użycie: ./start [--no-monitor] [--force-monitor]
+  --no-monitor     : nie próbuj ustawiać trybu monitor
+  --force-monitor  : wymuś monitor (spróbuj, nawet jeśli niezalecane)
