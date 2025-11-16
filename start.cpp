@@ -42,6 +42,7 @@
 #include <unordered_map>
 #include <mutex>
 #include <algorithm>
+#include <arpa/inet.h>
 
 // Globalne wskaźniki używane przez signal handler i callback
 static pcap_t *global_handle = nullptr;
@@ -91,6 +92,14 @@ int main(int argc, char **argv) {
     std::string filter_enc;
     int capture_time = 0; // seconds; 0 = fallback to eapol_threshold
     int eapol_threshold = 3; // ile ramek EAPOL powoduje zakończenie, gdy -t nie ustawione
+    std::string out_dir; // katalog wyjściowy
+    std::string auto_name_format = "capture_%Y%m%d_%H%M%S.pcap"; // format nazwy zgodny ze strftime
+    int rotate_time = 0; // seconds; 0 = no rotation
+    bool eapol_dump_enabled = false;
+    std::string eapol_dump_file; // optional path
+    std::string pmkid_out_arg; // optional override for pmkid output
+    std::string hccapx_out_file; // experimental binary/text hccapx output
+    std::string handshake_out_dir; // directory to save extracted handshake pcaps/text
     for (int ai = 1; ai < argc; ++ai) {
         std::string a = argv[ai];
         if (a == "--no-monitor") opt_no_monitor = true;
@@ -100,6 +109,14 @@ int main(int argc, char **argv) {
         else if (a == "--filter-enc" && ai+1 < argc) { filter_enc = argv[++ai]; }
         else if ((a == "-t" || a == "--time") && ai+1 < argc) { capture_time = std::atoi(argv[++ai]); if (capture_time < 0) capture_time = 0; }
         else if ((a == "--eapol-count") && ai+1 < argc) { eapol_threshold = std::atoi(argv[++ai]); if (eapol_threshold < 1) eapol_threshold = 1; }
+        else if (a == "--out-dir" && ai+1 < argc) { out_dir = argv[++ai]; }
+        else if (a == "--auto-name-format" && ai+1 < argc) { auto_name_format = argv[++ai]; }
+        else if (a == "--rotate-time" && ai+1 < argc) { rotate_time = std::atoi(argv[++ai]); if (rotate_time < 1) rotate_time = 0; }
+        else if (a == "--eapol-dump") { eapol_dump_enabled = true; }
+        else if (a == "--eapol-dump-file" && ai+1 < argc) { eapol_dump_enabled = true; eapol_dump_file = argv[++ai]; }
+        else if (a == "--pmkid-out" && ai+1 < argc) { pmkid_out_arg = argv[++ai]; }
+        else if (a == "--hccapx-out" && ai+1 < argc) { hccapx_out_file = argv[++ai]; }
+        else if (a == "--handshake-out-dir" && ai+1 < argc) { handshake_out_dir = argv[++ai]; }
         else if (a == "-h" || a == "--help") {
             std::cout << "Użycie: " << argv[0] << " [--no-monitor] [--force-monitor] [--oui-db <file>] [--json <file>] [--filter-enc <enc>] [-t <s>]\n";
             std::cout << "  --no-monitor     : nie próbuj ustawiać trybu monitor\n";
@@ -109,6 +126,11 @@ int main(int argc, char **argv) {
             std::cout << "  --filter-enc <e> : podczas skanowania pokazuj tylko AP zawierające <e> w typie szyfrowania\n";
             std::cout << "  -t, --time <s>   : podczas przechwytywania zakończ po <s> sekundach; jeśli brak, zatrzymaj po wykryciu N ramek EAPOL (patrz --eapol-count)\n";
             std::cout << "  --eapol-count <n>: liczba ramek EAPOL potrzebna do zakończenia gdy -t nie ustawione (domyślnie 3)\n";
+            std::cout << "  --out-dir <dir>  : katalog do zapisu plików pcap (domyślnie bieżący katalog)\n";
+            std::cout << "  --auto-name-format <fmt> : format nazwy pliku zgodny ze strftime (domyślnie 'capture_%Y%m%d_%H%M%S.pcap')\n";
+            std::cout << "  --rotate-time <s>: automatyczna rotacja pliku pcap co <s> sekund (0 = wyłączona)\n";
+            std::cout << "  --eapol-dump     : zapisz wykryte ramki EAPOL do oddzielnego pliku pcap\n";
+            std::cout << "  --eapol-dump-file <file> : użyj konkretnej ścieżki pliku do dump EAPOL\n";
             return 0;
         }
     }
@@ -708,21 +730,35 @@ int main(int argc, char **argv) {
     }
 
     // Poproś o nazwę pliku wyjściowego. Jeśli użytkownik wciśnie Enter bez niczego,
-    // wygenerujemy nazwę domyślną opartą na znaczniku czasu: capture_YYYYMMDD_HHMMSS.pcap
+    // wygenerujemy nazwę domyślną według `auto_name_format`. Jeśli podano `--out-dir`, zapiszemy w tym katalogu.
     std::string outfile;
-    std::cout << "Nazwa pliku do zapisu (.pcap) [capture_<timestamp>.pcap]: ";
+    std::cout << "Nazwa pliku do zapisu (.pcap) [" << auto_name_format << "]: ";
     std::string tmp;
     std::getline(std::cin, tmp); // skasuj pozostały newline po wcześniejszym wejściu
     std::getline(std::cin, outfile);
-    if (outfile.empty()) {
+    auto make_filename_from_format = [&](const std::string &fmt)->std::string{
         time_t t = time(nullptr);
         struct tm *lt = localtime(&t);
-        char ts[64];
-        if (lt) strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", lt);
-        else std::snprintf(ts, sizeof(ts), "%lld", (long long)t);
-        std::string def = std::string("capture_") + ts + ".pcap";
-        outfile = def;
+        char buf[256];
+        if (lt) strftime(buf, sizeof(buf), fmt.c_str(), lt);
+        else std::snprintf(buf, sizeof(buf), "%lld", (long long)t);
+        return std::string(buf);
+    };
+    if (outfile.empty()) {
+        outfile = make_filename_from_format(auto_name_format);
         std::cout << "Używam domyślnej nazwy: " << outfile << "\n";
+    }
+    // jeśli podano katalog wyjściowy, stwórz go jeśli nie istnieje i połącz ścieżki
+    if (!out_dir.empty()) {
+        struct stat st;
+        if (stat(out_dir.c_str(), &st) != 0) {
+            // spróbuj utworzyć katalog (nie rekurencyjnie)
+            if (mkdir(out_dir.c_str(), 0755) != 0) {
+                std::cerr << "Nie można utworzyć katalogu wyjściowego: " << out_dir << "\n";
+            }
+        }
+        // połącz
+        if (!out_dir.empty() && out_dir.back() == '/') outfile = out_dir + outfile; else outfile = out_dir + "/" + outfile;
     }
 
     // Otwórz dumper
@@ -734,16 +770,74 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    // Jeśli eapol_dump_enabled, przygotuj plik EAPOL (domyślna nazwa eapol_<timestamp>.pcap)
+    pcap_dumper_t *eapol_dumper = nullptr;
+    std::string current_eapol_file;
+    // Plik na wykryte PMKID-y (format: PMKID*APMAC*STAMAC*PMKID*ESSID) — akceptowany przez hashcat/hcx-tools
+    std::ofstream pmkid_ofs;
+    std::string pmkid_file;
+    if (eapol_dump_enabled) {
+        if (!eapol_dump_file.empty()) {
+            current_eapol_file = eapol_dump_file;
+        } else {
+            std::string ef = outfile;
+            // spróbuj zamienić "capture" na "eapol" w nazwie, jeśli obecna
+            size_t pos = ef.find("capture");
+            if (pos != std::string::npos) ef.replace(pos, 7, "eapol");
+            else ef = std::string("eapol_") + ef;
+            current_eapol_file = ef;
+        }
+        eapol_dumper = pcap_dump_open(global_handle, current_eapol_file.c_str());
+        if (!eapol_dumper) {
+            std::cerr << "Nie można utworzyć pliku EAPOL: " << current_eapol_file << " (" << pcap_geterr(global_handle) << ")\n";
+            // nie przerywamy, tylko wyłączamy eapol dump
+            eapol_dumper = nullptr;
+            eapol_dump_enabled = false;
+        } else {
+            std::cout << "Zapis EAPOL do: " << current_eapol_file << "\n";
+        }
+    }
+
+    // przygotuj plik PMKID jeśli możliwe (nazwę tworzymy obok pliku pcap lub używamy --pmkid-out)
+    auto make_pmkid_filename = [&](const std::string &base)->std::string{
+        std::string out = base;
+        // jeśli kończy się na .pcap, zamień na .pmkid
+        size_t pos = out.rfind(".pcap");
+        if (pos != std::string::npos) out.replace(pos, 5, ".pmkid"); else out += ".pmkid";
+        return out;
+    };
+    if (!pmkid_out_arg.empty()) {
+        pmkid_file = pmkid_out_arg;
+    } else if (!outfile.empty()) {
+        pmkid_file = make_pmkid_filename(outfile);
+    }
+    if (!pmkid_file.empty()) {
+        pmkid_ofs.open(pmkid_file, std::ios::out | std::ios::app);
+        if (pmkid_ofs) std::cout << "PMKID: zapisywanie do: " << pmkid_file << "\n";
+        else pmkid_file.clear();
+    }
+
     // Zarejestruj handler Ctrl+C
     std::signal(SIGINT, handle_sigint);
 
     std::cout << "Rozpoczynam przechwytywanie dla " << target.ssid << ". Naciśnij Ctrl+C, aby zakończyć.\n";
+
+    // Struktury do zbierania handshake'ów EAPOL (per AP<->STA)
+    struct HSKBuf {
+        std::vector<std::pair<struct pcap_pkthdr, std::vector<u_char>>> frames;
+        int mic_count = 0;
+        time_t first_ts = 0;
+        bool dumped = false;
+    };
+    std::map<std::string, HSKBuf> hsk_map; // key = apmac + '|' + stamac
 
     // Pętla przechwytywania — zapisujemy pakiety do pliku
     // Jeśli użytkownik podał -t/--time, przechwytywanie zakończy się po tej liczbie sekund.
     // Jeśli nie podano limitu czasu, zakończymy przechwytywanie po wykryciu 3 ramek EAPOL (typ 0x888e).
     time_t start_ts = time(nullptr);
     int eapol_count = 0;
+    time_t file_start_ts = start_ts;
+    std::string current_outfile = outfile;
     while (!stop_flag) {
         struct pcap_pkthdr *h;
         const u_char *pkt;
@@ -760,6 +854,161 @@ int main(int argc, char **argv) {
             }
             if (found_eapol) {
                 ++eapol_count;
+                if (eapol_dump_enabled && eapol_dumper) {
+                    // zapisz ramkę EAPOL do oddzielnego pliku
+                    pcap_dump(reinterpret_cast<u_char*>(eapol_dumper), h, pkt);
+                }
+                // Wyciągnij MAC AP i STA z nagłówka 802.11 (po radiotap)
+                uint16_t rt_len_local = 0;
+                if (h->caplen >= 4) rt_len_local = *(const uint16_t*)(pkt + 2);
+                if (rt_len_local != 0 && rt_len_local + 24 <= h->caplen) {
+                    const u_char *dot11_local = pkt + rt_len_local;
+                    std::string apmac_local = mac_to_str(dot11_local + 16); // addr3
+                    std::string stamac_local = mac_to_str(dot11_local + 10); // addr2
+
+                    // Buforuj ramkę w hsk_map
+                    std::string key = apmac_local + "|" + stamac_local;
+                    auto &hb = hsk_map[key];
+                    if (hb.frames.empty()) hb.first_ts = h->ts.tv_sec;
+                    // skopiuj nagłówek i payload
+                    struct pcap_pkthdr ph = *h;
+                    std::vector<u_char> data(pkt, pkt + h->caplen);
+                    hb.frames.emplace_back(ph, std::move(data));
+
+                    // Spróbuj rozpoznać czy EAPOL-Key ma MIC
+                    const u_char *eapol_ptr = nullptr;
+                    int eapol_off = -1;
+                    for (u_int i = 0; i + 1 < h->caplen; ++i) {
+                        if (pkt[i] == 0x88 && pkt[i+1] == 0x8e) { eapol_ptr = pkt + i; eapol_off = i; break; }
+                    }
+                    if (eapol_ptr) {
+                        int remain = h->caplen - eapol_off;
+                        if (remain >= 99) {
+                            uint8_t eapol_type = eapol_ptr[1];
+                            if (eapol_type == 3) {
+                                // key_info at eapol_ptr + 5..6 (relative to eapol start+4)
+                                const u_char *key_info_p = eapol_ptr + 4 + 1; // relative
+                                uint16_t key_info = *(const uint16_t*)key_info_p;
+                                // check MIC bit (bit 8 of key_info when read little/big?) — heuristic: if MIC bytes non-zero in expected MIC pos
+                                const u_char *micp = eapol_ptr + 4 + 77; // key MIC offset relative to eapol start
+                                bool has_mic = false;
+                                if (remain >= 93) {
+                                    // check if MIC not all zero
+                                    has_mic = false;
+                                    for (int z=0; z<16; ++z) if (micp[z] != 0) { has_mic = true; break; }
+                                }
+                                if (has_mic) hb.mic_count++;
+                            }
+                        }
+                    }
+
+                    // Warunek zapisania handshake: co najmniej 4 ramek lub 2 z MIC
+                    if (!hb.dumped && (hb.frames.size() >= 4 || hb.mic_count >= 2)) {
+                        // przygotuj nazwę pliku pcap dla handshake
+                        char tbuf[64];
+                        time_t nowt = time(nullptr);
+                        struct tm *lt = localtime(&nowt);
+                        strftime(tbuf, sizeof(tbuf), "%Y%m%d_%H%M%S", lt);
+                        std::string clean_ap = apmac_local; for (char &c: clean_ap) if (c==':') c='-';
+                        std::string clean_sta = stamac_local; for (char &c: clean_sta) if (c==':') c='-';
+                        std::string hpcap = std::string("handshake_") + clean_ap + "_" + clean_sta + "_" + tbuf + ".pcap";
+                        if (!handshake_out_dir.empty()) {
+                            if (handshake_out_dir.back() == '/') hpcap = handshake_out_dir + hpcap; else hpcap = handshake_out_dir + "/" + hpcap;
+                        }
+                        pcap_dumper_t *hd = pcap_dump_open(global_handle, hpcap.c_str());
+                        if (hd) {
+                            for (auto &fp : hb.frames) {
+                                pcap_dump(reinterpret_cast<u_char*>(hd), &fp.first, fp.second.data());
+                            }
+                            pcap_dump_close(hd);
+                            std::cout << C_CYAN << "Zapisano handshake pcap: " << hpcap << C_RESET << "\n";
+                        } else {
+                            std::cerr << "Nie mozna zapisac handshake pcap: " << hpcap << "\n";
+                        }
+                        // zapis podsumowania tekstowego (ANonce/SNonce/MIC jeśli dostępne)
+                        std::string htxt = hpcap + ".txt";
+                        std::ofstream hf(htxt);
+                        if (hf) {
+                            hf << "AP=" << apmac_local << "\n";
+                            hf << "STA=" << stamac_local << "\n";
+                            hf << "frames=" << hb.frames.size() << "\n";
+                            hf << "mic_count=" << hb.mic_count << "\n";
+                            hf.close();
+                            std::cout << C_CYAN << "Zapisano handshake summary: " << htxt << C_RESET << "\n";
+                        }
+                        hb.dumped = true;
+                    }
+                }
+                // Dodatkowo spróbuj wykryć PMKID w polu Key Data EAPOL-Key
+                // Szukamy sekwencji 0x88 0x8e i traktujemy jej pozycję jako początek EAPOL
+                for (u_int i = 0; i + 1 < h->caplen; ++i) {
+                    if (!(pkt[i] == 0x88 && pkt[i+1] == 0x8e)) continue;
+                    const u_char *eapol = pkt + i;
+                    int remain = h->caplen - i;
+                    // Potrzebujemy co najmniej 4 bajty (EAPOL header) + 97 bajtów stałej części EAPOL-Key
+                    if (remain < 101) continue;
+                    uint8_t eapol_type = eapol[1];
+                    if (eapol_type != 3) continue; // interesują nas tylko EAPOL-Key
+                    // key_data_length jest na offsetcie 97 od początku EAPOL (4 bytes header + 93)
+                    uint16_t key_data_len = ntohs(*(const uint16_t*)(eapol + 97));
+                    if ((int)key_data_len <= 0) continue;
+                    if (remain < 99 + key_data_len) continue;
+                    const u_char *key_data = eapol + 99;
+                    int kd_rem = key_data_len;
+
+                    // Spróbuj znaleźć PMKID: RSN PMKID list ma postać: 2 bajty count + count*16 bajtów PMKID
+                    for (int off = 0; off + 2 <= kd_rem; ++off) {
+                        uint16_t cnt_be = ntohs(*(const uint16_t*)(key_data + off));
+                        uint16_t cnt_le = *(const uint16_t*)(key_data + off);
+                        uint16_t cnt = 0;
+                        // wybierz sensowną interpretację (niezerową i mieszczącą się)
+                        if (cnt_be > 0 && (int)cnt_be * 16 <= kd_rem - (off + 2)) cnt = cnt_be;
+                        else if (cnt_le > 0 && (int)cnt_le * 16 <= kd_rem - (off + 2)) cnt = cnt_le;
+                        if (cnt == 0) continue;
+                        // mamy listę PMKID-ów
+                        for (uint16_t pi = 0; pi < cnt; ++pi) {
+                            const u_char *pm = key_data + off + 2 + pi * 16;
+                            // przygotuj hex PMKID
+                            char ph[33+1];
+                            for (int z = 0; z < 16; ++z) std::sprintf(ph + z*2, "%02x", pm[z]);
+                            ph[32] = '\0';
+
+                            // Wyciągnij MAC AP i STA z nagłówka 802.11 (po radiotap)
+                            uint16_t rt_len = 0;
+                            if (h->caplen >= 4) rt_len = *(const uint16_t*)(pkt + 2);
+                            if (rt_len == 0 || rt_len + 24 > h->caplen) {
+                                // nie udało się odczytać nagłówka 802.11
+                                continue;
+                            }
+                            const u_char *dot11 = pkt + rt_len;
+                            const u_char *addr1 = dot11 + 4;
+                            const u_char *addr2 = dot11 + 10;
+                            const u_char *addr3 = dot11 + 16;
+                            std::string apmac = mac_to_str(addr3);
+                            std::string stamac = mac_to_str(addr2);
+
+                            // lookup SSID jeśli mamy w mapie
+                            std::string ssid = "";
+                            {
+                                std::lock_guard<std::mutex> lk(aps_mtx);
+                                auto it = aps.find(apmac);
+                                if (it != aps.end()) ssid = it->second.ssid;
+                            }
+                            if (ssid.empty()) ssid = target.ssid;
+                            // escape quotes/newlines
+                            for (char &c: ssid) if (c == '"' || c == '\n' || c == '\r') c = '_';
+
+                            // Zapisz linię w formacie akceptowanym przez hashcat/hcx-tools
+                            if (!pmkid_file.empty() && pmkid_ofs) {
+                                pmkid_ofs << ph << "*" << apmac << "*" << stamac << "*" << ssid << "\n";
+                                pmkid_ofs.flush();
+                            }
+                            std::cout << C_CYAN << "PMKID wykryty: " << ph << " (" << apmac << "*" << stamac << ") ssid='" << ssid << "'" << C_RESET << "\n";
+                        }
+                        // Po znalezieniu PMKID nie szukaj dalej w tym key_data (unikamy duplikatów)
+                        break;
+                    }
+                }
             }
         } else if (res == 0) {
             // timeout, kontynuuj
@@ -782,6 +1031,38 @@ int main(int argc, char **argv) {
             if (eapol_count >= eapol_threshold) {
                 std::cout << "Koniec: wykryto " << eapol_threshold << " ramek EAPOL (przybliżenie hashy).\n";
                 break;
+            }
+        }
+        // obsługa rotacji czasowej pliku pcap
+        if (rotate_time > 0) {
+            if (difftime(time(nullptr), file_start_ts) >= rotate_time) {
+                // zamknij aktualnego dumpersa i otwórz nowego
+                if (global_dumper) { pcap_dump_close(global_dumper); global_dumper = nullptr; }
+                if (eapol_dumper) { pcap_dump_close(eapol_dumper); eapol_dumper = nullptr; }
+                // wygeneruj nową nazwę bazując na formatcie i aktualnym czasie
+                std::string newname = make_filename_from_format(auto_name_format);
+                if (!out_dir.empty()) {
+                    if (!out_dir.empty() && out_dir.back() == '/') newname = out_dir + newname; else newname = out_dir + "/" + newname;
+                }
+                current_outfile = newname;
+                global_dumper = pcap_dump_open(global_handle, current_outfile.c_str());
+                if (!global_dumper) {
+                    std::cerr << "Rotacja: nie można otworzyć nowego pliku pcap: " << current_outfile << "\n";
+                } else {
+                    std::cout << "Rotacja: nowy plik: " << current_outfile << "\n";
+                }
+                if (eapol_dump_enabled) {
+                    std::string newe = current_outfile;
+                    size_t pos = newe.find("capture");
+                    if (pos != std::string::npos) newe.replace(pos, 7, "eapol"); else newe = std::string("eapol_") + newe;
+                    current_eapol_file = newe;
+                    eapol_dumper = pcap_dump_open(global_handle, current_eapol_file.c_str());
+                    if (!eapol_dumper) {
+                        std::cerr << "Rotacja: nie można otworzyć pliku EAPOL: " << current_eapol_file << "\n";
+                        eapol_dump_enabled = false;
+                    }
+                }
+                file_start_ts = time(nullptr);
             }
         }
     }
